@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import io
 from pydub import AudioSegment
 from google.auth.transport.requests import Request
@@ -247,16 +248,70 @@ def cleanup_files(*filepaths):
                 print(f"Warning: Could not delete {f}. Error: {e}")
 
 
+def main_process_handler(event, context):
+    """
+    Serverless function handler to trigger the video conversion.
+    Expects a JSON body with 'video_url' and 'folder_url'.
+    """
+    print("--- Serverless Handler Received Request ---")
+
+    # 1. Parse the request body
+    raw_body = event.get("body", "{}")
+    try:
+        body_dict = json.loads(raw_body)
+    except json.JSONDecodeError:
+        print("Error: Invalid JSON body format")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"message": "Invalid JSON body format"}),
+        }
+
+    # 2. Get required parameters from the body
+    video_url = body_dict.get("video_url")
+    folder_url = body_dict.get("folder_url")
+
+    if not video_url or not folder_url:
+        print("Error: 'video_url' and 'folder_url' are required.")
+        return {
+            "statusCode": 400,
+            "body": json.dumps(
+                {"message": "'video_url' and 'folder_url' are required in the body."}
+            ),
+        }
+
+    # 3. Call the main business logic
+    try:
+        success, message = main_process(video_url, folder_url)
+
+        if success:
+            print(f"Success: {message}")
+            return {"statusCode": 200, "body": json.dumps({"message": message})}
+        else:
+            print(f"Failure: {message}")
+            # 500 status code indicates a server-side processing error
+            return {"statusCode": 500, "body": json.dumps({"message": message})}
+    except Exception as e:
+        # Catch-all for any unhandled exceptions
+        print(f"Critical handler error: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps(
+                {"message": f"An unexpected server error occurred: {str(e)}"}
+            ),
+        }
+
+
 def main_process(video_url, folder_url):
     """
     The main function that orchestrates the entire process.
+    Returns a tuple: (bool_success, message_string)
     """
     # 1. Authenticate
     print("Authenticating with Google Drive...")
     service = authenticate_google_drive()
     if not service:
         print("Failed to authenticate. Exiting.")
-        return
+        return (False, "Failed to authenticate with Google Drive.")
 
     # 2. Extract IDs
     video_id = extract_id_from_url(video_url)
@@ -264,42 +319,69 @@ def main_process(video_url, folder_url):
 
     if not video_id or not folder_id:
         print("Could not extract valid ID from one or both URLs. Exiting.")
-        return
+        return (False, "Could not extract valid ID from one or both URLs.")
 
     print(f"Video ID: {video_id}")
     print(f"Folder ID: {folder_id}")
 
-    # 3. Download
+    # 3. Download, Convert, Upload
     mp4_file = None
     mp3_file = None
     try:
         mp4_file, original_name = download_file(service, video_id)
         if not mp4_file:
-            return  # Download failed
+            return (False, "Download failed.")  # Download failed
 
         # 4. Convert
         mp3_file = convert_to_mp3(mp4_file, original_name)
         if not mp3_file:
-            return  # Conversion failed
+            return (False, "Conversion failed.")  # Conversion failed
 
         # 5. Upload
         upload_to_folder(service, mp3_file, folder_id)
+
+        # If we get here, all steps were successful
+        message = f"Successfully processed and uploaded: {mp3_file}"
+        print(message)
+        return (True, message)
+
+    except Exception as e:
+        # Catch any other unexpected errors during the process
+        error_message = f"An unexpected error occurred: {e}"
+        print(error_message)
+        return (False, error_message)
 
     finally:
         # 6. Cleanup
         print("Cleaning up local files...")
         cleanup_files(mp4_file, mp3_file)
-        print("Process complete.")
+        print("Cleanup complete.")
 
 
 if __name__ == "__main__":
-    print("--- Google Drive Video to MP3 Converter ---")
+    print("--- Google Drive Video to MP3 Converter (Serverless Test) ---")
     print("NOTE: You must follow the README.md setup instructions first.\n")
 
+    # --- Define the test data ---
     video_url = "https://drive.google.com/file/d/17IlHTmWUGf3yOAlzO4Nnx7ANX3EjQSX4/view?usp=sharing"
     folder_url = "https://drive.google.com/drive/folders/17We1iX19Osse1tSX3JIg3DicwqKIUlmR?usp=sharing"
 
     if not video_url or not folder_url:
-        print("Both URLs are required.")
+        print("Both URLs are required for the test.")
     else:
-        main_process(video_url, folder_url)
+        # --- Create a mock 'event' similar to a serverless environment ---
+        # The body is a JSON *string*, just as it would be from an API Gateway
+        mock_event = {
+            "body": json.dumps({"video_url": video_url, "folder_url": folder_url})
+        }
+
+        # 'context' is often not needed for simple handlers, so we pass None
+        mock_context = None
+
+        # --- Call the new handler function ---
+        print("Starting handler test...")
+        result = main_process_handler(mock_event, mock_context)
+
+        print("\n--- Handler Result ---")
+        print(json.dumps(result, indent=2))
+        print("------------------------")
