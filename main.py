@@ -2,6 +2,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, HttpUrl
 
+# Assuming the file above is saved as 'drive_video_converter.py'
 import drive_video_converter
 
 app = FastAPI(
@@ -33,21 +34,21 @@ async def convert_video(request: ConversionRequest):
     1. Download the video.
     2. Convert it to a low-bitrate MP3.
     3. Upload the MP3 to the specified folder.
+
+    Returns the new file's ID and URL on success.
     """
     print(f"Received request to convert: {request.video_url}")
     try:
-        # Call the main business logic from your drive_converter.py
-        success, message = drive_video_converter.main_process(
+        success, result_data = drive_video_converter.main_process(
             str(request.video_url), str(request.folder_url)
         )
 
         if success:
-            # If the process is successful, return a 200 OK
-            return {"status": "success", "message": message}
+            return {"status": "success", **result_data}
         else:
-            # If the process fails, return a 500 server error
+            error_message = result_data.get("message", "Unknown server error")
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=message
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_message
             )
 
     except Exception as e:

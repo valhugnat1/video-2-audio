@@ -207,9 +207,10 @@ def convert_to_mp3(mp4_filepath, original_filename):
 def upload_to_folder(service, mp3_filepath, folder_id):
     """
     Uploads the generated MP3 file to a specific Google Drive folder.
+    Returns the new file's ID and web view link on success.
     """
     if not mp3_filepath:
-        return
+        return None, None
 
     try:
         file_metadata = {
@@ -223,16 +224,23 @@ def upload_to_folder(service, mp3_filepath, folder_id):
 
         file = (
             service.files()
-            .create(body=file_metadata, media_body=media, fields="id")
+            .create(body=file_metadata, media_body=media, fields="id, webViewLink")
             .execute()
         )
 
-        print(f"Successfully uploaded. File ID: {file.get('id')}")
+        file_id = file.get("id")
+        web_link = file.get("webViewLink")
+
+        print(f"Successfully uploaded. File ID: {file_id}")
+
+        return file_id, web_link
 
     except HttpError as error:
         print(f"An error occurred during upload: {error}")
+        return None, None  # Return None on failure
     except Exception as e:
         print(f"An unexpected error occurred during upload: {e}")
+        return None, None  # Return None on failure
 
 
 def cleanup_files(*filepaths):
@@ -281,15 +289,17 @@ def main_process_handler(event, context):
 
     # 3. Call the main business logic
     try:
-        success, message = main_process(video_url, folder_url)
+        success, result_data = main_process(video_url, folder_url)
 
         if success:
-            print(f"Success: {message}")
-            return {"statusCode": 200, "body": json.dumps({"message": message})}
+            print(f"Success: {result_data.get('message')}")
+            # Return the entire result dictionary
+            return {"statusCode": 200, "body": json.dumps(result_data)}
         else:
-            print(f"Failure: {message}")
-            # 500 status code indicates a server-side processing error
-            return {"statusCode": 500, "body": json.dumps({"message": message})}
+            print(f"Failure: {result_data.get('message')}")
+            # Return the entire result dictionary
+            return {"statusCode": 500, "body": json.dumps(result_data)}
+
     except Exception as e:
         # Catch-all for any unhandled exceptions
         print(f"Critical handler error: {e}")
@@ -304,14 +314,14 @@ def main_process_handler(event, context):
 def main_process(video_url, folder_url):
     """
     The main function that orchestrates the entire process.
-    Returns a tuple: (bool_success, message_string)
+    Returns a tuple: (bool_success, result_dictionary)
     """
     # 1. Authenticate
     print("Authenticating with Google Drive...")
     service = authenticate_google_drive()
     if not service:
         print("Failed to authenticate. Exiting.")
-        return (False, "Failed to authenticate with Google Drive.")
+        return (False, {"message": "Failed to authenticate with Google Drive."})
 
     # 2. Extract IDs
     video_id = extract_id_from_url(video_url)
@@ -319,7 +329,7 @@ def main_process(video_url, folder_url):
 
     if not video_id or not folder_id:
         print("Could not extract valid ID from one or both URLs. Exiting.")
-        return (False, "Could not extract valid ID from one or both URLs.")
+        return (False, {"message": "Could not extract valid ID from one or both URLs."})
 
     print(f"Video ID: {video_id}")
     print(f"Folder ID: {folder_id}")
@@ -330,26 +340,34 @@ def main_process(video_url, folder_url):
     try:
         mp4_file, original_name = download_file(service, video_id)
         if not mp4_file:
-            return (False, "Download failed.")  # Download failed
+            return (False, {"message": "Download failed."})
 
         # 4. Convert
         mp3_file = convert_to_mp3(mp4_file, original_name)
         if not mp3_file:
-            return (False, "Conversion failed.")  # Conversion failed
+            # --- MODIFICATION: Return a dict for failure ---
+            return (False, {"message": "Conversion failed."})
 
         # 5. Upload
-        upload_to_folder(service, mp3_file, folder_id)
+        new_file_id, new_file_url = upload_to_folder(service, mp3_file, folder_id)
 
-        # If we get here, all steps were successful
+        if not new_file_id:
+            return (False, {"message": "Upload failed."})
+
         message = f"Successfully processed and uploaded: {mp3_file}"
         print(message)
-        return (True, message)
+        result_data = {
+            "message": message,
+            "file_id": new_file_id,
+            "file_url": new_file_url,
+        }
+        return (True, result_data)
 
     except Exception as e:
         # Catch any other unexpected errors during the process
         error_message = f"An unexpected error occurred: {e}"
         print(error_message)
-        return (False, error_message)
+        return (False, {"message": error_message})
 
     finally:
         # 6. Cleanup
@@ -359,6 +377,7 @@ def main_process(video_url, folder_url):
 
 
 if __name__ == "__main__":
+    # ... (The __main__ block logic remains the same) ...
     print("--- Google Drive Video to MP3 Converter (Serverless Test) ---")
     print("NOTE: You must follow the README.md setup instructions first.\n")
 
