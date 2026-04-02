@@ -14,7 +14,7 @@ from google.oauth2 import service_account
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB hard limit
+MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB hard limit
 ALLOWED_DRIVE_HOSTS = {"drive.google.com"}
 OUTPUT_BITRATE = "32k"
 

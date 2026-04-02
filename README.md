@@ -109,7 +109,7 @@ curl -X POST http://localhost:8080/convert \
 
 - **Authentication** — Every `/convert` request requires a valid Bearer token.
 - **URL validation** — Only `https://drive.google.com` URLs are accepted (SSRF protection).
-- **File size limit** — Files larger than 10 GB are rejected before download (configurable via `MAX_FILE_SIZE_BYTES`).
+- **File size limit** — Files larger than 2 GB are rejected before download (configurable via `MAX_FILE_SIZE_BYTES`).
 - **File isolation** — Each conversion runs in a dedicated temporary directory (`tempfile.mkdtemp`), always cleaned up in a `finally` block.
 - **Filename sanitization** — `sanitize_filename()` neutralizes path traversals (`..`, `/`) and special characters.
 - **Opaque errors** — HTTP responses never contain internal details (stack traces, file paths). Detailed errors are logged server-side only.
@@ -122,7 +122,7 @@ In `drive_video_converter.py`:
 | Constant | Default              | Description |
 |---|----------------------|---|
 | `OUTPUT_BITRATE` | `"32k"`              | Output MP3 bitrate. Use `"64k"` for better speech quality, `"128k"` for music. |
-| `MAX_FILE_SIZE_BYTES` | `10 * 1024³` (10 GB) | Maximum allowed size for the source file. |
+| `MAX_FILE_SIZE_BYTES` | `2 * 1024³` (2 GB) | Maximum allowed size for the source file. |
 
 ## n8n integration
 
