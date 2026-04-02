@@ -24,7 +24,7 @@ COPY . .
 
 # 6. Expose Port
 # Tell Docker the container listens on port 8000
-EXPOSE 8000
+EXPOSE 8080
 
 # 7. Run the Application
 # This is the command to start the FastAPI server when the container launches

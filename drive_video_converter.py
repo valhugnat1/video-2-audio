@@ -2,63 +2,35 @@ import os
 import re
 import json
 import io
+import os
 from pydub import AudioSegment
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from google.oauth2 import service_account
 
-# If modifying these scopes, delete token.json.
+
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
+
 def authenticate_google_drive():
-    """
-    Handles Google Drive authentication.
-    Looks for token.json, and if not present or invalid,
-    runs the OAuth 2.0 flow using credentials.json.
-    Returns the authenticated service object.
-    """
-    creds = None
-    # The file token.json stores the user's access and refresh tokens, and is
-    # created automatically when the authorization flow completes for the first
-    # time.
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception as e:
-                print(f"Error refreshing token: {e}")
-                print("Deleting old token.json and re-authenticating...")
-                os.remove("token.json")
-                return authenticate_google_drive()  # Retry auth
-        else:
-            if not os.path.exists("credentials.json"):
-                print("Error: credentials.json not found.")
-                print(
-                    "Please follow the README.md to set up your Google Cloud credentials."
-                )
-                return None
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        # Save the credentials for the next run
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-
     try:
+        sa_json = os.environ.get("GOOGLE_SA_CREDENTIALS")
+        if not sa_json:
+            print("Error: GOOGLE_SA_CREDENTIALS env var not set")
+            return None
+
+        sa_info = json.loads(sa_json)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=SCOPES
+        )
         service = build("drive", "v3", credentials=creds)
         return service
-    except HttpError as error:
-        print(f"An error occurred building the service: {error}")
+    except Exception as e:
+        print(f"Authentication error: {e}")
         return None
-
 
 def extract_id_from_url(url):
     """
@@ -83,26 +55,25 @@ def extract_id_from_url(url):
     print(f"Warning: Could not extract ID from URL: {url}")
     return None
 
-
 def download_file(service, file_id):
-    """
-    D    downloads a file from Google Drive given its ID.
-        Returns the local filepath and the original filename.
-    """
     try:
-        # Get file metadata to find the name
-        file_metadata = service.files().get(fileId=file_id, fields="name").execute()
+        file_metadata = service.files().get(
+            fileId=file_id, fields="name, mimeType"
+        ).execute()
         original_filename = file_metadata.get("name")
+        mime_type = file_metadata.get("mimeType", "")
 
-        if not original_filename:
-            print("Could not get file metadata. Aborting.")
+        print(f"File: '{original_filename}' (mimeType: {mime_type})")
+
+        # Les enregistrements Google Meet sont souvent des video/mp4
+        # mais marqués comme non-téléchargeables si le partage est restreint.
+        # Les fichiers Google natifs (Docs, Slides...) nécessitent export.
+        if mime_type.startswith("application/vnd.google-apps"):
+            # Pour une vidéo Google-native, on ne peut pas vraiment exporter en mp4
+            print("Error: This is a Google-native file that cannot be exported as video.")
             return None, None
 
-        print(f"Starting download for: '{original_filename}'...")
-
         request = service.files().get_media(fileId=file_id)
-
-        # Use a memory buffer to hold the downloaded file
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, request)
 
@@ -111,19 +82,14 @@ def download_file(service, file_id):
             status, done = downloader.next_chunk()
             print(f"Download {int(status.progress() * 100)}%.")
 
-        # Save the downloaded file locally
         local_filename = f"temp_video_{file_id}.mp4"
         with open(local_filename, "wb") as f:
             f.write(fh.getvalue())
 
-        print(f"Successfully downloaded to: {local_filename}")
         return local_filename, original_filename
 
     except HttpError as error:
-        print(f"An error occurred during download: {error}")
-        return None, None
-    except Exception as e:
-        print(f"An unexpected error occurred during download: {e}")
+        print(f"Download error: {error}")
         return None, None
 
 

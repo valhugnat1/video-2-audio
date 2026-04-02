@@ -1,4 +1,3 @@
-credentials.json
-token.json
+service_account.json
 .env
 transcribe.txt

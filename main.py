@@ -4,6 +4,7 @@ from pydantic import BaseModel, HttpUrl
 
 # Assuming the file above is saved as 'drive_video_converter.py'
 import drive_video_converter
+import os, io
 
 app = FastAPI(
     title="Google Drive Video-to-MP3 Converter",
@@ -11,54 +12,61 @@ app = FastAPI(
 )
 
 
+
 class ConversionRequest(BaseModel):
-    """Defines the expected JSON body for the conversion request."""
-
-    # Using HttpUrl provides basic validation that the input is a URL
     video_url: HttpUrl
-    folder_url: HttpUrl
-
-
 @app.get("/", summary="Health Check", include_in_schema=False)
 async def root():
     """A simple health check endpoint."""
     return {"message": "Converter API is running."}
 
+from fastapi.responses import StreamingResponse
 
-@app.post("/convert", summary="Start Video to MP3 Conversion")
+@app.post("/convert", summary="Convert Google Drive video to MP3")
 async def convert_video(request: ConversionRequest):
     """
-    Takes a Google Drive video URL and a target folder URL.
-
-    The server will then:
-    1. Download the video.
-    2. Convert it to a low-bitrate MP3.
-    3. Upload the MP3 to the specified folder.
-
-    Returns the new file's ID and URL on success.
+    Downloads a video from Google Drive, converts to MP3,
+    and returns the audio file directly in the response.
     """
     print(f"Received request to convert: {request.video_url}")
+
+    service = drive_video_converter.authenticate_google_drive()
+    if not service:
+        raise HTTPException(status_code=500, detail="Google Drive auth failed")
+
+    video_id = drive_video_converter.extract_id_from_url(str(request.video_url))
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Could not extract video ID from URL")
+
+    mp4_file = None
+    mp3_file = None
     try:
-        success, result_data = drive_video_converter.main_process(
-            str(request.video_url), str(request.folder_url)
+        mp4_file, original_name = drive_video_converter.download_file(service, video_id)
+        if not mp4_file:
+            raise HTTPException(status_code=500, detail="Download failed")
+
+        mp3_file = drive_video_converter.convert_to_mp3(mp4_file, original_name)
+        if not mp3_file:
+            raise HTTPException(status_code=500, detail="Conversion failed")
+
+        # Lire le MP3 en mémoire avant de cleanup
+        with open(mp3_file, "rb") as f:
+            mp3_bytes = f.read()
+
+        safe_name = drive_video_converter.sanitize_filename(
+            os.path.splitext(original_name)[0] + ".mp3"
         )
 
-        if success:
-            return {"status": "success", **result_data}
-        else:
-            error_message = result_data.get("message", "Unknown server error")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_message
-            )
-
-    except Exception as e:
-        # Catch-all for any other unexpected errors in the API layer
-        print(f"Critical API error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected API error occurred: {str(e)}",
+        return StreamingResponse(
+            io.BytesIO(mp3_bytes),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}"'
+            },
         )
 
+    finally:
+        drive_video_converter.cleanup_files(mp4_file, mp3_file)
 
 if __name__ == "__main__":
     # This allows you to run locally for testing without Docker
