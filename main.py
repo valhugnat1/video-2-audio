@@ -1,74 +1,130 @@
+import os
+import io
+import logging
+
 import uvicorn
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel, HttpUrl
-
-# Assuming the file above is saved as 'drive_video_converter.py'
-import drive_video_converter
-import os, io
-
-app = FastAPI(
-    title="Google Drive Video-to-MP3 Converter",
-    description="An API to convert video files in Google Drive to MP3 format.",
-)
-
-
-
-class ConversionRequest(BaseModel):
-    video_url: HttpUrl
-@app.get("/", summary="Health Check", include_in_schema=False)
-async def root():
-    """A simple health check endpoint."""
-    return {"message": "Converter API is running."}
-
 from fastapi.responses import StreamingResponse
 
-@app.post("/convert", summary="Convert Google Drive video to MP3")
+import drive_video_converter
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
+)
+logger = logging.getLogger("api")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="Google Drive Video-to-MP3 Converter",
+    description="Secure API to convert Google Drive video files to MP3.",
+    docs_url=None,   # disable Swagger UI in production
+    redoc_url=None,   # disable ReDoc in production
+)
+
+# ---------------------------------------------------------------------------
+# Authentication dependency
+# ---------------------------------------------------------------------------
+API_SECRET = os.environ.get("API_SECRET")
+
+
+async def verify_token(authorization: str = Header(..., alias="Authorization")):
+    """
+    Require a Bearer token that matches the API_SECRET env var.
+    If API_SECRET is not set the service refuses to start serving requests.
+    """
+    if not API_SECRET:
+        logger.error("API_SECRET env var is not configured — rejecting all requests")
+        raise HTTPException(status_code=503, detail="Service not configured")
+
+    # Expect "Bearer <token>"
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    if parts[1] != API_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ---------------------------------------------------------------------------
+# Request model
+# ---------------------------------------------------------------------------
+class ConversionRequest(BaseModel):
+    video_url: HttpUrl
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/", summary="Health Check", include_in_schema=False)
+async def root():
+    """Simple health check — does not require auth."""
+    return {"status": "ok"}
+
+
+@app.post(
+    "/convert",
+    summary="Convert a Google Drive video to MP3",
+    dependencies=[Depends(verify_token)],
+)
 async def convert_video(request: ConversionRequest):
     """
-    Downloads a video from Google Drive, converts to MP3,
-    and returns the audio file directly in the response.
+    Downloads a video from Google Drive, converts it to MP3,
+    and streams the audio file back in the response.
     """
-    print(f"Received request to convert: {request.video_url}")
+    video_url = str(request.video_url)
+    logger.info("Conversion request received")
 
-    service = drive_video_converter.authenticate_google_drive()
-    if not service:
-        raise HTTPException(status_code=500, detail="Google Drive auth failed")
-
-    video_id = drive_video_converter.extract_id_from_url(str(request.video_url))
-    if not video_id:
-        raise HTTPException(status_code=400, detail="Could not extract video ID from URL")
-
-    mp4_file = None
-    mp3_file = None
+    # Run the full pipeline; work_dir is always cleaned up in `finally`.
+    work_dir = None
     try:
-        mp4_file, original_name = drive_video_converter.download_file(service, video_id)
-        if not mp4_file:
-            raise HTTPException(status_code=500, detail="Download failed")
+        success, result, work_dir = drive_video_converter.main_process(
+            video_url=video_url,
+            folder_url=None,  # no upload — we stream the result back
+        )
 
-        mp3_file = drive_video_converter.convert_to_mp3(mp4_file, original_name)
-        if not mp3_file:
-            raise HTTPException(status_code=500, detail="Conversion failed")
+        if not success:
+            # Return a generic message; details are in server logs
+            raise HTTPException(status_code=500, detail="Conversion pipeline failed")
 
-        # Lire le MP3 en mémoire avant de cleanup
-        with open(mp3_file, "rb") as f:
+        mp3_path = result.get("mp3_path")
+        if not mp3_path or not os.path.isfile(mp3_path):
+            raise HTTPException(status_code=500, detail="Conversion pipeline failed")
+
+        # Read into memory so we can clean up the temp dir immediately after
+        with open(mp3_path, "rb") as f:
             mp3_bytes = f.read()
 
         safe_name = drive_video_converter.sanitize_filename(
-            os.path.splitext(original_name)[0] + ".mp3"
+            os.path.splitext(os.path.basename(mp3_path))[0] + ".mp3"
         )
+
+        logger.info("Streaming back %d bytes as '%s'", len(mp3_bytes), safe_name)
 
         return StreamingResponse(
             io.BytesIO(mp3_bytes),
             media_type="audio/mpeg",
-            headers={
-                "Content-Disposition": f'attachment; filename="{safe_name}"'
-            },
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
         )
 
+    except HTTPException:
+        raise  # re-raise known HTTP errors as-is
+    except Exception:
+        logger.exception("Unhandled error in /convert")
+        # Generic message — never leak internals
+        raise HTTPException(status_code=500, detail="Internal server error")
     finally:
-        drive_video_converter.cleanup_files(mp4_file, mp3_file)
+        drive_video_converter.cleanup_work_dir(work_dir)
 
+
+# ---------------------------------------------------------------------------
+# Local dev entry-point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # This allows you to run locally for testing without Docker
-    # Run with: python main.py
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)

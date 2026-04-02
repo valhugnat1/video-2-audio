@@ -1,31 +1,30 @@
 # 1. Base Image
-# Use an official Python runtime as a parent image
 FROM python:3.10-slim
 
-# 2. Install System Dependencies
-# FFmpeg is a critical system dependency required by pydub to read MP4s
-# and write MP3s.
-RUN apt-get update && apt-get install -y ffmpeg \
+# 2. Install system dependencies (FFmpeg for pydub)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Set Working Directory
+# 3. Non-root user for defense in depth
+RUN useradd --create-home --shell /bin/bash appuser
+
+# 4. Working directory
 WORKDIR /app
 
-# 4. Install Python Dependencies
-# Copy requirements first to leverage Docker layer caching
+# 5. Install Python dependencies (layer cache)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Copy Application Code and Credentials
-# This copies all files from your project folder into the /app directory
-# in the container.
+# 6. Copy application code
 COPY . .
 
-# 6. Expose Port
-# Tell Docker the container listens on port 8000
+# 7. Own the app dir, then drop privileges
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# 8. Expose the port uvicorn will listen on
 EXPOSE 8080
 
-# 7. Run the Application
-# This is the command to start the FastAPI server when the container launches
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 9. Start the server
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

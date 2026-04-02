@@ -2,7 +2,9 @@ import os
 import re
 import json
 import io
-import os
+import tempfile
+import shutil
+import logging
 from pydub import AudioSegment
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -10,16 +12,29 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.oauth2 import service_account
 
 
-
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB hard limit
+ALLOWED_DRIVE_HOSTS = {"drive.google.com"}
+OUTPUT_BITRATE = "32k"
 
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("drive_converter")
+logger.setLevel(logging.INFO)
+
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
 def authenticate_google_drive():
     try:
         sa_json = os.environ.get("GOOGLE_SA_CREDENTIALS")
         if not sa_json:
-            print("Error: GOOGLE_SA_CREDENTIALS env var not set")
+            logger.error("GOOGLE_SA_CREDENTIALS env var not set")
             return None
 
         sa_info = json.loads(sa_json)
@@ -28,23 +43,42 @@ def authenticate_google_drive():
         )
         service = build("drive", "v3", credentials=creds)
         return service
-    except Exception as e:
-        print(f"Authentication error: {e}")
+    except Exception:
+        logger.exception("Authentication error")
         return None
 
-def extract_id_from_url(url):
+
+# ---------------------------------------------------------------------------
+# URL validation & ID extraction
+# ---------------------------------------------------------------------------
+def validate_drive_url(url: str) -> bool:
     """
-    Uses regular expressions to extract the Google Drive
-    file/folder ID from various URL formats.
+    Ensure the URL points to Google Drive and nothing else (SSRF prevention).
     """
-    # Regex to find the ID in common Google Drive URL patterns
-    # e.g., /file/d/FILE_ID/edit
-    # e.g., /drive/folders/FOLDER_ID
-    # e.g., ?id=FILE_ID
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.hostname not in ALLOWED_DRIVE_HOSTS:
+        logger.warning("Rejected non-Drive URL: host=%s", parsed.hostname)
+        return False
+    if parsed.scheme not in ("https",):
+        logger.warning("Rejected non-HTTPS URL: scheme=%s", parsed.scheme)
+        return False
+    return True
+
+
+def extract_id_from_url(url: str) -> str | None:
+    """
+    Extract the Google Drive file/folder ID from various URL formats.
+    Returns None if the URL is invalid or the ID cannot be found.
+    """
+    if not validate_drive_url(url):
+        return None
+
     patterns = [
         r"/file/d/([a-zA-Z0-9_-]+)",
         r"/drive/folders/([a-zA-Z0-9_-]+)",
-        r"id=([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)",
     ]
 
     for pattern in patterns:
@@ -52,25 +86,72 @@ def extract_id_from_url(url):
         if match:
             return match.group(1)
 
-    print(f"Warning: Could not extract ID from URL: {url}")
+    logger.warning("Could not extract ID from URL")
     return None
 
-def download_file(service, file_id):
+
+# ---------------------------------------------------------------------------
+# Filename sanitisation (path-traversal safe)
+# ---------------------------------------------------------------------------
+def sanitize_filename(filename: str) -> str:
+    """
+    Remove / neutralise dangerous characters and prevent path traversal.
+    """
+    # Replace non-breaking spaces
+    filename = filename.replace("\xa0", " ")
+
+    # Strip directory components first (path traversal prevention)
+    filename = os.path.basename(filename)
+
+    # Remove remaining invalid chars
+    invalid_chars = r'[\\/:*?"<>|]'
+    safe = re.sub(invalid_chars, "_", filename)
+
+    # Remove leading dots (hidden files / traversal)
+    safe = safe.lstrip(".")
+
+    safe = safe.strip()
+    if not safe:
+        safe = "unnamed_file"
+
+    return safe
+
+
+# ---------------------------------------------------------------------------
+# Download with size check
+# ---------------------------------------------------------------------------
+def download_file(service, file_id: str, work_dir: str):
+    """
+    Download a file from Google Drive into *work_dir*.
+    Returns (local_path, original_filename) or (None, None).
+    """
     try:
-        file_metadata = service.files().get(
-            fileId=file_id, fields="name, mimeType"
-        ).execute()
-        original_filename = file_metadata.get("name")
+        file_metadata = (
+            service.files()
+            .get(fileId=file_id, fields="name, mimeType, size")
+            .execute()
+        )
+        original_filename = file_metadata.get("name", "video")
         mime_type = file_metadata.get("mimeType", "")
+        file_size = int(file_metadata.get("size", 0))
 
-        print(f"File: '{original_filename}' (mimeType: {mime_type})")
+        logger.info(
+            "File: '%s' (mimeType: %s, size: %d bytes)",
+            original_filename,
+            mime_type,
+            file_size,
+        )
 
-        # Les enregistrements Google Meet sont souvent des video/mp4
-        # mais marqués comme non-téléchargeables si le partage est restreint.
-        # Les fichiers Google natifs (Docs, Slides...) nécessitent export.
+        # --- Size guard ---
+        if file_size > MAX_FILE_SIZE_BYTES:
+            logger.error(
+                "File too large: %d bytes (limit %d)", file_size, MAX_FILE_SIZE_BYTES
+            )
+            return None, None
+
+        # --- Google-native files cannot be exported as video ---
         if mime_type.startswith("application/vnd.google-apps"):
-            # Pour une vidéo Google-native, on ne peut pas vraiment exporter en mp4
-            print("Error: This is a Google-native file that cannot be exported as video.")
+            logger.error("Google-native file cannot be exported as video")
             return None, None
 
         request = service.files().get_media(fileId=file_id)
@@ -78,102 +159,61 @@ def download_file(service, file_id):
         downloader = MediaIoBaseDownload(fh, request)
 
         done = False
-        while done is False:
+        while not done:
             status, done = downloader.next_chunk()
-            print(f"Download {int(status.progress() * 100)}%.")
+            logger.info("Download %d%%", int(status.progress() * 100))
 
-        local_filename = f"temp_video_{file_id}.mp4"
+        # Write to isolated work directory with a fixed name (no user input)
+        local_filename = os.path.join(work_dir, "input.mp4")
         with open(local_filename, "wb") as f:
             f.write(fh.getvalue())
 
         return local_filename, original_filename
 
-    except HttpError as error:
-        print(f"Download error: {error}")
+    except HttpError:
+        logger.exception("Google Drive API error during download")
+        return None, None
+    except Exception:
+        logger.exception("Unexpected error during download")
         return None, None
 
 
-def sanitize_filename(filename):
+# ---------------------------------------------------------------------------
+# Conversion
+# ---------------------------------------------------------------------------
+def convert_to_mp3(mp4_filepath: str, original_filename: str, work_dir: str):
     """
-    Removes invalid characters from a filename
-    to make it safe for saving locally.
-    """
-    # Replace non-breaking space with regular space
-    filename = filename.replace("\xa0", " ")
-
-    # Define a set of invalid characters
-    # (slashes, colons, and others common on Windows/Mac/Linux)
-    invalid_chars = r'[\\/:*?"<>|]'
-
-    # Replace all invalid characters with an underscore
-    safe_filename = re.sub(invalid_chars, "_", filename)
-
-    # You might also want to strip leading/trailing whitespace
-    safe_filename = safe_filename.strip()
-
-    # Ensure filename isn't empty after sanitizing
-    if not safe_filename:
-        safe_filename = "unnamed_file"
-
-    return safe_filename
-
-
-def convert_to_mp3(mp4_filepath, original_filename):
-    """
-    Converts the downloaded MP4 file to MP3 using pydub.
-    Returns the path to the new MP3 file.
+    Convert an MP4 file to MP3. Output is written inside *work_dir*.
+    Returns the path to the MP3 file or None.
     """
     if not mp4_filepath:
         return None
 
-    # Sanitize the original filename to make it safe for the local filesystem
     safe_original_filename = sanitize_filename(original_filename)
-
-    # Create a new filename for the mp3, e.g., "My Video.mp4" -> "My Video.mp3"
     base_filename = os.path.splitext(safe_original_filename)[0]
-    mp3_filename = f"{base_filename}.mp3"
+    mp3_filename = os.path.join(work_dir, f"{base_filename}.mp3")
 
-    print(f"Converting '{mp4_filepath}' to '{mp3_filename}'...")
+    logger.info("Converting '%s' → '%s'", mp4_filepath, mp3_filename)
 
     try:
-        # Load the video file (pydub can read mp4)
         audio = AudioSegment.from_file(mp4_filepath, format="mp4")
+        audio.export(mp3_filename, format="mp3", bitrate=OUTPUT_BITRATE)
 
-        # --- START: MODIFICATIONS FOR SMALLER FILE ---
-
-        # 1. (Optional) Convert to Mono
-        # If the audio is stereo, this will cut the file size in half.
-        # Great for speech, podcasts, or lectures.
-        # Uncomment the line below to enable it.
-        # audio = audio.set_channels(1)
-
-        # 2. Set the Bitrate
-        # This is the primary way to control file size vs. quality.
-        # "128k" = Good quality, standard for music.
-        # "64k"  = Good for speech-only content, significantly smaller.
-        # "32k"  = Very small, but may have noticeable quality loss.
-        output_bitrate = "32k"
-
-        # Export as MP3 with the specified bitrate
-        audio.export(mp3_filename, format="mp3", bitrate=output_bitrate)
-
-        # --- END: MODIFICATIONS ---
-
-        print(f"Successfully converted to: {mp3_filename} (Bitrate: {output_bitrate})")
+        logger.info("Conversion OK: %s (bitrate: %s)", mp3_filename, OUTPUT_BITRATE)
         return mp3_filename
 
-    except Exception as e:
-        print(f"An error occurred during conversion: {e}")
-        print(
-            "Please make sure FFmpeg is installed and accessible in your system's PATH."
-        )
+    except Exception:
+        logger.exception("Conversion error")
         return None
 
 
-def upload_to_folder(service, mp3_filepath, folder_id):
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+def upload_to_folder(service, mp3_filepath: str, folder_id: str):
     """
-    Uploads the generated MP3 file to a specific Google Drive folder.
-    Returns the new file's ID and web view link on success.
+    Upload MP3 to a Google Drive folder.
+    Returns (file_id, web_view_link) or (None, None).
     """
     if not mp3_filepath:
         return None, None
@@ -181,192 +221,93 @@ def upload_to_folder(service, mp3_filepath, folder_id):
     try:
         file_metadata = {
             "name": os.path.basename(mp3_filepath),
-            "parents": [folder_id],  # Specify the folder to upload into
+            "parents": [folder_id],
         }
-
         media = MediaFileUpload(mp3_filepath, mimetype="audio/mpeg")
 
-        print(f"Uploading '{mp3_filepath}' to Google Drive...")
+        logger.info("Uploading '%s' to Drive folder %s", mp3_filepath, folder_id)
 
-        file = (
+        uploaded = (
             service.files()
             .create(body=file_metadata, media_body=media, fields="id, webViewLink")
             .execute()
         )
 
-        file_id = file.get("id")
-        web_link = file.get("webViewLink")
-
-        print(f"Successfully uploaded. File ID: {file_id}")
-
+        file_id = uploaded.get("id")
+        web_link = uploaded.get("webViewLink")
+        logger.info("Upload OK — file ID: %s", file_id)
         return file_id, web_link
 
-    except HttpError as error:
-        print(f"An error occurred during upload: {error}")
-        return None, None  # Return None on failure
-    except Exception as e:
-        print(f"An unexpected error occurred during upload: {e}")
-        return None, None  # Return None on failure
+    except HttpError:
+        logger.exception("Google Drive API error during upload")
+        return None, None
+    except Exception:
+        logger.exception("Unexpected error during upload")
+        return None, None
 
 
-def cleanup_files(*filepaths):
+# ---------------------------------------------------------------------------
+# Safe temp-dir cleanup helper
+# ---------------------------------------------------------------------------
+def cleanup_work_dir(work_dir: str | None):
+    """Remove the entire temporary working directory."""
+    if work_dir and os.path.isdir(work_dir):
+        try:
+            shutil.rmtree(work_dir)
+            logger.info("Cleaned up work dir: %s", work_dir)
+        except Exception:
+            logger.exception("Could not clean up work dir %s", work_dir)
+
+
+# ---------------------------------------------------------------------------
+# Main orchestration (used by both FastAPI and serverless handler)
+# ---------------------------------------------------------------------------
+def main_process(video_url: str, folder_url: str | None = None):
     """
-    Deletes local temporary files.
+    Orchestrate download → convert → (optional upload).
+    Returns (success: bool, result: dict, work_dir: str).
+    The caller is responsible for calling cleanup_work_dir(work_dir).
     """
-    for f in filepaths:
-        if f and os.path.exists(f):
-            try:
-                os.remove(f)
-                print(f"Cleaned up local file: {f}")
-            except Exception as e:
-                print(f"Warning: Could not delete {f}. Error: {e}")
+    work_dir = tempfile.mkdtemp(prefix="drive_conv_")
+    logger.info("Work directory: %s", work_dir)
 
-
-def main_process_handler(event, context):
-    """
-    Serverless function handler to trigger the video conversion.
-    Expects a JSON body with 'video_url' and 'folder_url'.
-    """
-    print("--- Serverless Handler Received Request ---")
-
-    # 1. Parse the request body
-    raw_body = event.get("body", "{}")
-    try:
-        body_dict = json.loads(raw_body)
-    except json.JSONDecodeError:
-        print("Error: Invalid JSON body format")
-        return {
-            "statusCode": 400,
-            "body": json.dumps({"message": "Invalid JSON body format"}),
-        }
-
-    # 2. Get required parameters from the body
-    video_url = body_dict.get("video_url")
-    folder_url = body_dict.get("folder_url")
-
-    if not video_url or not folder_url:
-        print("Error: 'video_url' and 'folder_url' are required.")
-        return {
-            "statusCode": 400,
-            "body": json.dumps(
-                {"message": "'video_url' and 'folder_url' are required in the body."}
-            ),
-        }
-
-    # 3. Call the main business logic
-    try:
-        success, result_data = main_process(video_url, folder_url)
-
-        if success:
-            print(f"Success: {result_data.get('message')}")
-            # Return the entire result dictionary
-            return {"statusCode": 200, "body": json.dumps(result_data)}
-        else:
-            print(f"Failure: {result_data.get('message')}")
-            # Return the entire result dictionary
-            return {"statusCode": 500, "body": json.dumps(result_data)}
-
-    except Exception as e:
-        # Catch-all for any unhandled exceptions
-        print(f"Critical handler error: {e}")
-        return {
-            "statusCode": 500,
-            "body": json.dumps(
-                {"message": f"An unexpected server error occurred: {str(e)}"}
-            ),
-        }
-
-
-def main_process(video_url, folder_url):
-    """
-    The main function that orchestrates the entire process.
-    Returns a tuple: (bool_success, result_dictionary)
-    """
-    # 1. Authenticate
-    print("Authenticating with Google Drive...")
+    # --- Auth ---
     service = authenticate_google_drive()
     if not service:
-        print("Failed to authenticate. Exiting.")
-        return (False, {"message": "Failed to authenticate with Google Drive."})
+        return False, {"message": "Google Drive authentication failed."}, work_dir
 
-    # 2. Extract IDs
+    # --- Extract IDs ---
     video_id = extract_id_from_url(video_url)
-    folder_id = extract_id_from_url(folder_url)
+    if not video_id:
+        return False, {"message": "Invalid or disallowed video URL."}, work_dir
 
-    if not video_id or not folder_id:
-        print("Could not extract valid ID from one or both URLs. Exiting.")
-        return (False, {"message": "Could not extract valid ID from one or both URLs."})
+    folder_id = None
+    if folder_url:
+        folder_id = extract_id_from_url(folder_url)
+        if not folder_id:
+            return False, {"message": "Invalid or disallowed folder URL."}, work_dir
 
-    print(f"Video ID: {video_id}")
-    print(f"Folder ID: {folder_id}")
+    # --- Download ---
+    mp4_file, original_name = download_file(service, video_id, work_dir)
+    if not mp4_file:
+        return False, {"message": "Download failed."}, work_dir
 
-    # 3. Download, Convert, Upload
-    mp4_file = None
-    mp3_file = None
-    try:
-        mp4_file, original_name = download_file(service, video_id)
-        if not mp4_file:
-            return (False, {"message": "Download failed."})
+    # --- Convert ---
+    mp3_file = convert_to_mp3(mp4_file, original_name, work_dir)
+    if not mp3_file:
+        return False, {"message": "Conversion failed."}, work_dir
 
-        # 4. Convert
-        mp3_file = convert_to_mp3(mp4_file, original_name)
-        if not mp3_file:
-            # --- MODIFICATION: Return a dict for failure ---
-            return (False, {"message": "Conversion failed."})
+    result_data = {
+        "message": f"Successfully converted: {sanitize_filename(original_name)}",
+        "mp3_path": mp3_file,
+    }
 
-        # 5. Upload
+    # --- Optional upload ---
+    if folder_id:
         new_file_id, new_file_url = upload_to_folder(service, mp3_file, folder_id)
-
         if not new_file_id:
-            return (False, {"message": "Upload failed."})
+            return False, {"message": "Upload failed."}, work_dir
+        result_data["file_id"] = new_file_id
+        result_data["file_url"] = new_file_url
 
-        message = f"Successfully processed and uploaded: {mp3_file}"
-        print(message)
-        result_data = {
-            "message": message,
-            "file_id": new_file_id,
-            "file_url": new_file_url,
-        }
-        return (True, result_data)
-
-    except Exception as e:
-        # Catch any other unexpected errors during the process
-        error_message = f"An unexpected error occurred: {e}"
-        print(error_message)
-        return (False, {"message": error_message})
-
-    finally:
-        # 6. Cleanup
-        print("Cleaning up local files...")
-        cleanup_files(mp4_file, mp3_file)
-        print("Cleanup complete.")
-
-
-if __name__ == "__main__":
-    # ... (The __main__ block logic remains the same) ...
-    print("--- Google Drive Video to MP3 Converter (Serverless Test) ---")
-    print("NOTE: You must follow the README.md setup instructions first.\n")
-
-    # --- Define the test data ---
-    video_url = "https://drive.google.com/file/d/17IlHTmWUGf3yOAlzO4Nnx7ANX3EjQSX4/view?usp=sharing"
-    folder_url = "https://drive.google.com/drive/folders/17We1iX19Osse1tSX3JIg3DicwqKIUlmR?usp=sharing"
-
-    if not video_url or not folder_url:
-        print("Both URLs are required for the test.")
-    else:
-        # --- Create a mock 'event' similar to a serverless environment ---
-        # The body is a JSON *string*, just as it would be from an API Gateway
-        mock_event = {
-            "body": json.dumps({"video_url": video_url, "folder_url": folder_url})
-        }
-
-        # 'context' is often not needed for simple handlers, so we pass None
-        mock_context = None
-
-        # --- Call the new handler function ---
-        print("Starting handler test...")
-        result = main_process_handler(mock_event, mock_context)
-
-        print("\n--- Handler Result ---")
-        print(json.dumps(result, indent=2))
-        print("------------------------")
+    return True, result_data, work_dir
