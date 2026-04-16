@@ -1,10 +1,11 @@
 import os
 import io
 import logging
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, Header
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 from fastapi.responses import StreamingResponse
 
 import drive_video_converter
@@ -23,27 +24,22 @@ logger = logging.getLogger("api")
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Google Drive Video-to-MP3 Converter",
-    description="Secure API to convert Google Drive video files to MP3.",
-    docs_url=None,   # disable Swagger UI in production
-    redoc_url=None,   # disable ReDoc in production
+    description="Multi-tenant API to convert Google Drive video files to MP3.",
+    docs_url=None,
+    redoc_url=None,
 )
 
 # ---------------------------------------------------------------------------
-# Authentication dependency
+# Auth (shared bearer to gate the service itself)
 # ---------------------------------------------------------------------------
 API_SECRET = os.environ.get("API_SECRET")
 
 
 async def verify_token(authorization: str = Header(..., alias="Authorization")):
-    """
-    Require a Bearer token that matches the API_SECRET env var.
-    If API_SECRET is not set the service refuses to start serving requests.
-    """
     if not API_SECRET:
         logger.error("API_SECRET env var is not configured — rejecting all requests")
         raise HTTPException(status_code=503, detail="Service not configured")
 
-    # Expect "Bearer <token>"
     parts = authorization.split(" ", 1)
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -56,7 +52,22 @@ async def verify_token(authorization: str = Header(..., alias="Authorization")):
 # Request model
 # ---------------------------------------------------------------------------
 class ConversionRequest(BaseModel):
+    """
+    The caller provides the Google Service Account JSON in `google_credentials`,
+    so the same image can serve any number of tenants without server-side storage.
+    """
     video_url: HttpUrl
+    google_credentials: dict[str, Any] = Field(
+        ...,
+        description="Parsed Service Account JSON (the full key contents).",
+    )
+
+    # Pydantic v2: prevent accidental logging of the model
+    def __repr__(self) -> str:
+        return f"ConversionRequest(video_url={self.video_url}, google_credentials=<redacted>)"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +75,6 @@ class ConversionRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/", summary="Health Check", include_in_schema=False)
 async def root():
-    """Simple health check — does not require auth."""
     return {"status": "ok"}
 
 
@@ -74,30 +84,26 @@ async def root():
     dependencies=[Depends(verify_token)],
 )
 async def convert_video(request: ConversionRequest):
-    """
-    Downloads a video from Google Drive, converts it to MP3,
-    and streams the audio file back in the response.
-    """
     video_url = str(request.video_url)
-    logger.info("Conversion request received")
+    logger.info("Conversion request received")  # never log the body
 
-    # Run the full pipeline; work_dir is always cleaned up in `finally`.
     work_dir = None
     try:
         success, result, work_dir = drive_video_converter.main_process(
             video_url=video_url,
-            folder_url=None,  # no upload — we stream the result back
+            credentials=request.google_credentials,
+            folder_url=None,
         )
 
         if not success:
-            # Return a generic message; details are in server logs
-            raise HTTPException(status_code=500, detail="Conversion pipeline failed")
+            # Surface the safe message produced by main_process
+            # (e.g. "Invalid Google credentials.", "Download failed.", etc.)
+            raise HTTPException(status_code=400, detail=result.get("message", "Failed"))
 
         mp3_path = result.get("mp3_path")
         if not mp3_path or not os.path.isfile(mp3_path):
             raise HTTPException(status_code=500, detail="Conversion pipeline failed")
 
-        # Read into memory so we can clean up the temp dir immediately after
         with open(mp3_path, "rb") as f:
             mp3_bytes = f.read()
 
@@ -114,10 +120,11 @@ async def convert_video(request: ConversionRequest):
         )
 
     except HTTPException:
-        raise  # re-raise known HTTP errors as-is
+        raise
     except Exception:
+        # Generic message to client; full trace stays server-side.
+        # NOTE: avoid logging the request object — it would leak the SA key.
         logger.exception("Unhandled error in /convert")
-        # Generic message — never leak internals
         raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         drive_video_converter.cleanup_work_dir(work_dir)
